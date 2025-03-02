@@ -1,0 +1,587 @@
+---
+title: "Final Project work Report"
+author: "Enrico Bazzacco (matricola 2122790)"
+date: "`r Sys.Date()`"
+output: pdf_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r, include=FALSE}
+dir <- rstudioapi::getActiveDocumentContext()$path
+setwd(dirname(dir))
+```
+
+# Objective of the project
+
+The objective is to develop and validate a predictive model that forecasts the diabetes status at 10 years (outcome) using an optimal subset of the variables  available at baseline in the given dataset.
+
+# Data
+
+## Data loading and exploration
+
+Once the dataset is loaded in the R workspace a preliminary exploration
+can be performed to asses the data quality, i.e. count the number of NAs
+in each variable relative to the total number of observations and to
+check for any unbalance relative to the outcome we want to predict.
+
+```{r, echo=FALSE}
+load('data_final_project.Rdata')
+cat('Number of observations =', nrow(data))
+cat('Number of variables =', ncol(data))
+```
+
+```{r}
+summary(data) #shows NAs in each column
+```
+
+The summary shows that there are numerous NAs in some of the variables. Special attention should be brought on variables like gluc, systolic_bp and diastolic_bp that contain a relevant percentage of missing values (around 30% for glucose). One might be tempted to exclude them, but considering the specific problem we are facing not using glucose as a predictor for diabetes sounds contradicting with the knowledge we have on the disease. Alternatively, one could consider a complete case analysis, which consists in analyzing only complete observations (no NAs). In this case such strategy would drastically reduce sample size so it's avoided.
+
+A simple way to manage missing values while maintaining the cardinality of the set is by imputing them with some specific values, as we do later on. 
+
+```{r, include=FALSE}
+table(data$outcome) #checks for class unbalance
+```
+
+```{r, echo=FALSE}
+cat('Fraction of observations with outcome 0 =', table(data$outcome)[1]/nrow(data))
+cat('Fraction of observations with outcome 1 =', table(data$outcome)[2]/nrow(data))
+```
+
+An unbalance in the outcome classes is also present and requires proper management.
+
+## Training/Test set split
+
+The first step to build a supervised ML model is to split the initial
+dataset into a training set that will be used to pre-process the data
+and train/tune the model and a test set that will be used to asses the
+model performance on novel data and validate it. The preliminary data
+exploration showed and unbalance in the two outcome classes. For this reason the training/test sets are created stratifying the subjects (observations) based on the outcome class, in order to create two sets that are statistically comparable to the initial set.  
+
+The rule of thumb for defining the sizes of the two sets is to assign 80% of the
+data to the training and the remaining 20% to the test.
+
+```{r}
+ind_0 <- which(data$outcome==0) #indexes of 0 class
+ind_1 <- which(data$outcome==1) #indexes of 1 class
+s <- 0.8 #splitting fraction
+set.seed(123) #setting RNG seed for reproducibility
+ind_0_training <- sample(ind_0, round(s*table(data$outcome)[1]), replace=F) #sampling from ind_0
+ind_1_training <- sample(ind_1, round(s*table(data$outcome)[2]), replace=F) #sampling from ind_1
+ind_training <- c(ind_0_training,ind_1_training) #concatenate training set indexes
+training_set <- data[ind_training,]
+test_set <- data[-ind_training,] 
+
+```
+
+Now we can check whether or not the outcome proportions have been
+maintained:
+
+```{r, echo=FALSE}
+cat('Fraction of observations with outcome 0 in training =', table(training_set$outcome)[1]/nrow(training_set))
+cat('Fraction of observations with outcome 1 in training =', table(training_set$outcome)[2]/nrow(training_set))
+cat('Fraction of observations with outcome 0 in test =', table(test_set$outcome)[1]/nrow(test_set))
+cat('Fraction of observations with outcome 1 in test =', table(test_set$outcome)[2]/nrow(test_set))
+```
+
+Evidently, the proportions are very similar.
+
+## Data pre-processing
+
+Prior to training the model, a pre-processing of the training data is
+carried out to ensure proper and optimal model definition. This step
+usually involves: 
+
+* checking the data for extreme points in the variables, the so called outliers, which are generally excluded from the
+set to avoid introducing any bias toward them; 
+* checking for collinearity among the variables, that might introduce useless model complexity, to exclude highly correlated features in favor of a simpler and more robust model.
+
+### Extreme data points
+
+To spot the outliers in the training set, the boxplot of each variable
+distribution is examined, here the most critical cases are reported:
+
+```{r, echo=FALSE}
+outliers_var <- c('ferritin','crprot','trig','gluc') #possible outliers
+par(mfrow=c(2,2))
+for(j in which(colnames(training_set) %in% outliers_var)){
+  boxplot(training_set[,j], main=paste0('Boxplot of ', colnames(training_set)[j]))
+}
+```
+
+As we can see these variables present some datapoints that sit very far,
+not only from the mean value (even by 1 or 2 orders of magnitude) and
+the "core" of the distribution, highlighted by the box (1st and 3rd
+quartiles), but also from the wiskers (1.5 times the inter-quartile
+distance) that generally discriminate the outliers.
+
+Ultimately, we decide to manage three of them them, leaving ferritin unaltered.
+To do so, a threshold to the variable values is set to exclude the
+observations that exceed it. In this case we choose the thresholds
+manually by inspecting the figures and can check how many observations
+have been discarded from the initial `r nrow(training_set)`:
+
+```{r}
+outliers_var <- c('crprot','trig','gluc') #definitive outliers
+outlier_thresholds <- c(80,300,1000) #manually selected thresholds
+ind_outliers <- numeric() #initialize vector
+par(mfrow=c(1,3))
+for(k in 1:length(outlier_thresholds)){
+  ind_var <- which(colnames(training_set) %in% outliers_var)[k] #variable column
+  ind_outliers <- c(ind_outliers,which(training_set[,ind_var]>outlier_thresholds[k])) #outlier row
+  boxplot(training_set[,ind_var],main=paste0('Boxplot of ', colnames(training_set)[ind_var]))
+  abline(h=outlier_thresholds[k],col='red')
+}
+
+training_set <- training_set[-unique(ind_outliers),] 
+ind_0_training <- which(training_set$outcome==0)
+ind_1_training <- which(training_set$outcome==1)
+print(paste('Number of observations in training set: ', nrow(training_set)))
+```
+
+Showing that we eliminated a total of `r 2611-nrow(training_set)`
+observations, specifically all the ones above the red lines displayed.
+
+### Collinearity
+
+```{r, include=FALSE}
+numerical_var <- sapply(data, is.numeric) #numerical variables names (numeric and integer)
+factor_var <- sapply(data, is.factor) #factor variables names
+```
+
+The correlation matrix of the numerical variables is computed and
+displayed:
+
+```{r}
+corr.matrix <- cor(training_set[,numerical_var], use = 'complete.obs') #correlation matrix
+par(mfrow=c(1,1))
+corrplot::corrplot(corr.matrix, method = 'color')
+corr_threshold <- 0.8 #correlation coefficient threshold
+high_corr <- which(abs(corr.matrix>0.8) & abs(corr.matrix)<1, arr.ind = T) #indices of highly correlated variables
+```
+
+Setting the correlation coefficient threshold to `r corr_threshold` the
+two couples of highly correlated variables identified are waist-bmi and
+ldl-tot_chol. A scatter plot is displayed to verify it:
+
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+graphics::plot(training_set$waist, training_set$bmi, main = 'waist vs. bmi', xlab = 'waist', ylab = 'bmi') #waist vs bmi
+graphics::plot(training_set$ldl, training_set$tot_chol, main = 'ldl vs. tot_chol', xlab = 'ldl', ylab = 'tot_chol') #ldl vs tot_chol
+```
+
+One could argue that also the systolic_bp and the diastolic_bp are
+correlated, even if the Pearson coefficient is only
+`r round(corr.matrix[18,17],digits=3)`:
+
+```{r, echo=FALSE}
+par(mfrow=c(1,1))
+graphics::plot(training_set$diastolic_bp, training_set$systolic_bp, main = 'Scatter plot', xlab = 'diastolic_bp', ylab = 'systolic_bp')
+```
+
+In this case we decide to keep both blood pressures, since a different
+role of them in the prediction might offer relevant clinical insight on
+the disease.
+
+Now that we identified the highly correlated variables, the way we
+proceed to select one out of each couple is by looking again at the
+correlation matrix: we keep the one with lower values against all the
+other variables, which therefore exhibits lighter colors in the plot. In
+conclusion we choose: 
+
+* bmi over waist, since waist presents a relevant negative correlation with hdl; 
+* ldl over tot_chol, since ldl appears to be less correlated to hdl than tot_chol. 
+
+For the latter couple one could also recall that tot_chol~ldl+hdl by definition, so the information in tot_chol is likely redundant when ldl and hdl are also present.
+
+```{r, include=FALSE}
+training_set$waist <- NULL
+test_set$waist <- NULL
+training_set$tot_chol <- NULL
+test_set$tot_chol <- NULL
+numerical_var <- sapply(training_set, is.numeric) #numerical variables names
+factor_var <- sapply(training_set, is.factor) #factor variables names
+```
+
+This leads us to a training and a test set with `r ncol(training_set)`
+variables left.
+
+### Imputation and Normalization
+
+As previously explained doing a complete case analysis wasn't promising so we decided to impute the missing values on both sets and keep all the observations. In particular, the value used for imputation are the mean and the mode extracted from the training set distributions.  
+
+In addition to that, a normalization based on the minimum and maximum values of each distribution is also carried out.
+
+```{r, include=FALSE}
+#Source functions
+source(paste0(dirname(dir), '/impute_mean_mode.R'))
+source(paste0(dirname(dir), '/normalize_min_max.R'))
+#Identify quantitative/categorical variables
+categorical_var <- which(colnames(training_set) %in% c('gender','education','marital_status','smoking',
+                                                        'depression_scale','mod_vig_pa','heartd_hx','hypertension','high_chol','sr_poor_health')) #indices
+quantitative_var <- which(!(1:ncol(training_set) %in% c(categorical_var,23))) #indices
+mode_var <- colnames(training_set)[categorical_var] #names
+mean_var <- colnames(training_set)[quantitative_var] #names
+
+#Imputation
+imputed_data <- impute_mean_mode(training_set, test_set, mean_var, mode_var)
+training_set_imput <- imputed_data$training_set_imput
+test_set_imput <- imputed_data$test_set_imput
+
+#Normalization
+norm_var <- colnames(training_set)[numerical_var] #names of numerical variables
+normalized_data <- normalize_min_max(training_set_imput, test_set_imput, norm_var)
+training_set_imput_norm<- normalized_data$training_set_norm
+test_set_imput_norm <- normalized_data$test_set_norm
+```
+
+A small subset is reported to verify the effectiveness of the operations:
+
+```{r}
+summary(training_set_imput_norm[,1:4])
+summary(test_set_imput_norm[,1:4])
+```
+
+It is worth noticing that, since the parameters for both imputation and normalization are extracted exclusively from the training set and then applied on the test set also, we might fail to properly normalize the test set in some critical instances, such as when the maximum value in the test set for a given variable is bigger than the one in the training set, as reported below.
+
+```{r, echo=FALSE}
+cat('Maximum hdl in training set = ', max(training_set_imput$hdl))
+cat('Maximum hdl in test set = ', max(test_set_imput$hdl))
+```
+
+```{r}
+summary(test_set_imput_norm$hdl)
+```
+
+
+# Model building
+
+As previously mentioned, the building of a ML model is made of a training step and a validation step. In the next sections multiple Generalized Linear Models (GLM) will be trained, fine tuned and later validated with a specific performance metric designed for binary classification problems, the Area Under the Receiver Operating Characteristic (AUROC).
+
+## Training
+The models trained in this analysis belong to the GLM class, in particular to the 'binomial' family corresponding to logistic regression for binary classes.
+
+### Full model
+
+A model that uses all the variables in the training set, called full, is trained as a benchmark for the following models:
+
+```{r}
+full_model <- glm(outcome~., family='binomial', data=training_set_imput_norm)
+summary(full_model)
+```
+
+The summary displays the estimated coefficients of the model paired with the standard error and the p-value of the estimates.  
+
+The coefficients corresponds to the factors that multiply each predictor (feature) in the logistic model described by a linear combination of the predictors. The meaning behind these coefficients lies in the definition of the logit function: ultimately the numbers represent the odds ratio of the outcome relative to a specific feature. A positive number means that the chances of developing the disease (positive outcome) increase by a factor of exp{coefficient} for each unitary increment of the variable. Inversely, a negative number stands for diminished chances by the same factor.  
+
+The p-values measure the accuracy of the estimates, therefore smaller values are associated with more robust estimates and allow to put more confidence in the results.  
+
+In this case features like bmi, ferritin, gluc, hba1c and systolic_bp have considerably large positive coefficients and very small p-values, therefore it is reasonable to assume that they are strong predictors of increased risk of diabetes. The fact that diastolic_bp doesn't shown the same relevance as the diastolic one suggests that the decision of keeping both in the model was fruitful.  
+
+Here we can appreciate how the data normalization comes in handy: since all the variables are brought to the same scale the coefficients are directly comparable to one another, so we can asses the relative weight of each feature in determining the outcome. According to the results hba1c is by far the most important risk factor for diabetes.  
+
+One last thing worth pointing out is how the glm() function in R automatically generates dummy variables to represent categorical features in the regression, as we can see in the summary for gender, etc. From what is shown, none of them seem to be strongly related to the disease, especially if we notice that the marital status appears to be more important than gender (doesn't sound very reliable).
+
+### Stepwise feature selection  
+
+The second model we build is obtained through a selection of the feature of the full model based on the whole/step-wise forward/backward algorithms that aim to minimize the AIC value of the model iteratively. The first step is to decide which of the four possible algorithms to implement. To do so we test them all and compare the selected features:
+
+```{r, include=FALSE}
+null_model <- glm(outcome ~ 1, data = training_set_imput_norm, family = "binomial") #null model (intercept only)model_range 
+model_range <- list(lower = formula(null_model), upper = formula(full_model)) #range of models to try
+
+backward_model <- step(full_model, model_range, direction='backward', trace=F) 
+forward_model <- step(null_model, model_range, direction='forward', trace=F) 
+stepwise_backward_model <- step(full_model, model_range, direction='both', trace=F)
+stepwise_forward_model <- step(null_model, model_range, direction='both', trace=F)
+```
+
+```{r, echo=FALSE}
+print('Selected features:')
+print('- Backward: ')
+print(names(sort(backward_model$coefficients)))
+print('- Forward: ')
+print(names(sort(forward_model$coefficients)))
+print('- Stepwise Backward: ')
+print(names(sort(stepwise_backward_model$coefficients)))
+print('- Stepwise Forward: ')
+print(names(sort(stepwise_forward_model$coefficients)))
+```
+
+All algorithms select the same `r length(names(sort(backward_model$coefficients)))-1` variables, suggesting that the performance are comparable, thus we keep the backward only as it is less computationally demanding than the others.
+
+#### Stability analysis  
+
+In order to fine tune the model we just defined, a stability analysis with bootstrap resampling is the strategy adopted.
+Note that for an optimal application of the bootstrap method, the original training set is first sampled with replacement and then imputed/normalized to ensure more coherence of the process.
+
+```{r, include=FALSE}
+Nboot <- 50 #number of bootstrap iterations
+features_bootstrap <- character() #initialize selected features aggregator
+set.seed(123)
+for(i in 1:Nboot){
+  cat('Iteration number = ', i, '\n') #counter
+  
+  ind_0_sample <- sample(ind_0_training, length(ind_0_training), replace = T)
+  ind_1_sample <- sample(ind_1_training, length(ind_1_training), replace = T)
+  ind_sample <- c(ind_0_sample, ind_1_sample)
+  training_set_bootstrap <- training_set[ind_sample, ]
+  test_set_bootstrap <- training_set[-ind_sample, ] 
+  
+  #Imputation
+  imputed_data <- impute_mean_mode(training_set_bootstrap, test_set_bootstrap, mean_var, mode_var)
+  training_set_imput_bootstrap <- imputed_data$training_set
+  test_set_imput_bootstrap <- imputed_data$test_set
+  
+  #Normalization
+  normalized_data <- normalize_min_max(training_set_imput_bootstrap, test_set_imput_bootstrap, norm_var)
+  training_set_imput_norm_bootstrap <- normalized_data$training_set_norm
+  test_set_imput_norm_bootstrap <- normalized_data$test_set_norm
+  
+  #Define baseline models
+  full_bootstrap <- glm(outcome ~ ., data = training_set_imput_norm_bootstrap, family = "binomial") #full model (all predictors)
+  null_bootstrap <- glm(outcome ~ 1, data = training_set_imput_norm_bootstrap, family = "binomial") #null model (intercept only)
+  range_bootstrap <- list(lower = formula(null_bootstrap), upper = formula(full_bootstrap))
+  
+  #Backward selection
+  backward_bootstrap <- step(full_bootstrap, range_bootstrap, direction = 'backward', trace = F)
+  features <- colnames(backward_bootstrap$model) #current model selected features
+  features <- features[-which(features=='outcome')] #remove outcome
+  
+  features_bootstrap <- c(features_bootstrap, features) #concatenate in the aggregator
+  #features only need to be aggregated and counted, no need to reference the model they come from
+}
+```
+
+The bootstrap on `r Nboot` iterations leads to the following rates of appearance of each variable, written as percentages:
+
+```{r, echo=FALSE}
+features_perc <- 100*table(features_bootstrap)/Nboot #features percentages
+sort(features_perc, decreasing = T) 
+perc <- 80 #percentage
+```
+
+As we can see, despite there being a good chunk of stable variables, a number of features turns out to be close to the critic value of 50% making it harder to define a threshold for selection. One way to address this would be to increase the number of iterations and see if the numbers settle down to more approachable values. In this case, due to computational constraints, we decide to keep these values and set a `r perc`% threshold (strict inequality), which seems restricting enough:
+
+```{r}
+selected_features <- names(features_perc[features_perc>perc]) #perc=80
+```
+
+selecting `r length(names(features_perc[features_perc>perc]))` features.
+
+#### Final model  
+
+  With this subset of variables the final model is trained:
+
+```{r}
+model_formula <- as.formula(paste('outcome', paste(selected_features, collapse = '+'), sep = '~'))
+final_backward_model <- glm(model_formula, training_set_imput_norm, family = 'binomial')
+summary(final_backward_model)
+```
+
+This model seems to agree quite well with the full one on all features' contribution. A stronger negative effect of hdl is detected. Moreover, here the p-values are all in the optimal range below 0.001 highlighting more accurate estimates and increased robustness.
+
+
+### LASSO regularization  
+
+The last model we inspect is obtained through a different approach to feature selection based on the regularization of the GLM. In particular a LASSO regression is implemented, which consists in the addition of an L1 penalty to the cost function of the model that allows to not only shrink the coefficients but also set some of them to zero.
+The penalty acts upon the coefficients vector norm, thus it is mandatory to normalize the data in order to avoid any distortion due to the different scales of the variables.
+
+```{r, include=FALSE}
+library(glmnet)
+K <- 5 #number of folds for cv
+```
+
+#### Cross Validation  
+
+The LASSO regression allows to fine tune the model by choosing an optimal value of the regularization coefficient (usually called lambda).
+This time such optimization is carried out with a `r K`-fold cross validation over a manually defined lambda vector that contains a proper grid with width and resolution for different magnitudes:
+
+```{r}
+lambda_vec <- c(seq(0.0001,0.001,0.0001),seq(0.001,0.01,0.001),seq(0.01,0.1,0.01))
+```
+
+```{r, include=FALSE}
+library(pROC)
+auroc_lambda_average <- numeric(length(lambda_vec)) #initialize average AUROCs vector
+for(i in 1:length(lambda_vec)){
+  auc_cv <- numeric(length(K)) #initialize 5 fold AUCs
+  
+  # 5 fold CV
+  ind_0_start <- ind_0_training #assign to new variable since they'll get modified
+  ind_1_start <- ind_1_training #same
+  
+  set.seed(123)
+  for (k in 1:K) {
+    # Sample the indices
+    ind_0_cv <- sample(ind_0_start, round(length(ind_0_training)/K), replace=F) #sampling of size #training_set/k
+    ind_1_cv <- sample(ind_1_start, floor(length(ind_1_training)/K), replace=F) #same
+    ind_0_start <- setdiff(ind_0_start,ind_0_cv) #remove already extracted indices 
+    ind_1_start <- setdiff(ind_1_start,ind_1_cv) #same
+    
+    # Create training/test sets of the current fold
+    test_set_cv <- training_set[c(ind_0_cv,ind_1_cv),] 
+    training_set_cv <- training_set[-c(ind_0_cv,ind_1_cv),]
+    
+    #Imputation
+    imputed_data <- impute_mean_mode(training_set_cv, test_set_cv, mean_var, mode_var)
+    training_set_imput_cv <- imputed_data$training_set
+    test_set_imput_cv <- imputed_data$test_set
+    
+    #Normalization
+    normalized_data <- normalize_min_max(training_set_imput_cv, test_set_imput_cv, norm_var)
+    training_set_imput_norm_cv <- normalized_data$training_set_norm
+    test_set_imput_norm_cv <- normalized_data$test_set_norm
+    
+    # Current fold model training
+    M_training <- model.matrix(outcome ~ ., training_set_imput_norm_cv)[,-1] #matrix formula
+    M_test <- model.matrix(outcome ~ ., test_set_imput_norm_cv)[,-1] #same for test
+    lasso_cv <- glmnet(M_training, training_set_imput_norm_cv$outcome, family = 'binomial', 
+                       alpha=1, lambda=lambda_vec[i], standardize=F)
+    
+    # Current fold model validation
+    lasso_cv_pred <- predict(lasso_cv, newx=M_test, type='response') #predictions
+    auc_cv[k] <- roc(test_set_imput_norm_cv$outcome, as.vector(lasso_cv_pred), quiet=T)$auc #AUROC
+    
+  }
+  
+  # For each lambda assign the cross validated values
+  auroc_lambda_average[i] <- mean(auc_cv) #mean over 5 folds
+  
+}
+auroc_max <- max(auroc_lambda_average)
+```
+
+The performance metric is the aforementioned AUROC. Initially, one could think that the optimal lambda is the one that maximizes the performance, but a closer look to the graph of the AUC with respect to lambda suggests otherwise:
+
+```{r, include=FALSE}
+# Optimal lambda
+max_difference <- 0.005 #maximum difference between max and average of the CV
+lambda_opt_ind <- which.max(lambda_vec[which(auroc_max-auroc_lambda_average<max_difference)])
+lambda_opt <- lambda_vec[lambda_opt_ind] #optimal lambda with parsimony criterion
+lambda_max_ind <- which.max(auroc_lambda_average)
+lambda_max <- lambda_vec[lambda_max_ind] #optimal lambda as the one maximizing AUC
+cat('Optimal lambda value with 5-fold Cross Validation:', lambda_opt)
+```
+
+```{r, echo=FALSE}
+# Visualize AURCOC(lambda) (zoomed in 0.0001-0.01)
+plot(lambda_vec[1:19], auroc_lambda_average[1:19], type='b',
+     main='Mean 5-fold CV AUROC(lambda) ', xlab='lambda', ylab='AUROC')
+points(c(lambda_opt,lambda_max), c(auroc_lambda_average[lambda_opt_ind], auroc_lambda_average[lambda_max_ind]), 
+       col=c('green','red'), lwd=3)
+text(c(lambda_opt,lambda_max), c(auroc_lambda_average[lambda_opt_ind], auroc_lambda_average[lambda_max_ind]),
+     labels=c('parsimony lambda','maximizing AUC lambda'),adj = c(0, 0))
+```
+
+From the plot it is clear that, despite there being a maximizing lambda, larger values of the parameter guarantee similar performance while applying a more effective feature selection. As a matter of fact, the optimal lambda, labeled as 'parsimony lambda' (green) in the plot, is the larger one among the values that return an AUC value sufficiently close to the maximum, by means of which the selection is more restrictive (heavier penalty on the norm).
+
+#### Final model
+
+With the optimal lambda identified above, the final LASSO model is trained:
+
+```{r}
+# Train optimal model with LASSO
+M_training <- model.matrix(outcome ~ ., training_set_imput_norm)[,-1] #create a matrix based formula
+M_test <- model.matrix(outcome ~ ., test_set_imput_norm)[,-1] #create a matrix based formula
+model_lasso_final <- glmnet(M_training, training_set_imput_norm$outcome, family = 'binomial',
+                            alpha = 1, lambda = lambda_opt, standardize = F)
+
+model_lasso_final$beta #display coefficients
+```
+
+From this summary we can appreciate how several feature coefficients are set to zero. All in all, the model seems in agreement with the other two on the most predictive variables yielding, again, a considerably large coefficient for hba1c.
+This time gender also appears to play a marginal role. On the other hand, the feature hdl shows, consistently with the previous models, a significant negative impact on the onset of diabetes (lowers the chances). It shouldn't surprise us that the estimated coefficients are smaller than in the other models, that is due to the shrinkage effect of the LASSO regression.
+
+
+## Validation
+
+The three models we built can now be validated on the test set that underwent imputation and normalization. It is important to note that none of the models have see the data in this set before. 
+
+```{r, include=FALSE}
+## Full model
+full_model_pred <- predict(full_model, newdata = test_set_imput_norm, type = 'response') #probabilities
+roc_full_model <- roc(response = test_set_imput_norm$outcome, predictor = full_model_pred, quiet=T)
+auroc_full_model <- roc_full_model$auc
+ci_full_model <- ci(roc_full_model)
+# Backward model
+backward_pred <- predict(backward_model, test_set_imput_norm, type = 'response')
+roc_backward <- roc(test_set_imput_norm$outcome, backward_pred, quiet=T)
+auroc_backward <- roc_backward$auc
+ci_backward <- ci(roc_backward)
+# LASSO
+lasso_final_pred <- predict(model_lasso_final, M_test, type = 'response')
+roc_lasso <- roc(test_set_imput_norm$outcome, as.vector(lasso_final_pred), quiet=T)
+auroc_lasso <- roc_lasso$auc
+ci_lasso <- ci(roc_lasso)
+```
+
+## ROC curves
+
+The ROC curves show that all the models achieve good performance on predicting the outcome being quite close to the ideal classifier (blue line):
+
+```{r, echo=FALSE}
+par(mfrow=c(1,3))
+
+x_full <- 1-roc_full_model$specificities #extract x axis (1-specificity)
+y_full <- roc_full_model$sensitivities #extract y axis (sensitivity)
+plot(x_full, y_full, main = 'Full Model', xlab = '1 - Specificity', ylab = 'Sensitivity', type = 'l') #plot
+lines(c(0,1),c(0,1),col='red') #add random classifier line (diagonal)
+lines(c(0,0),c(0,1), col='blue')
+lines(c(1,0),c(1,1), col='blue')
+
+x_back <- 1-roc_backward$specificities #extract x axis (1-specificity)
+y_back <- roc_backward$sensitivities #extract y axis (sensitivity)
+plot(x_back, y_back, main = 'Backward Model', xlab = '1 - Specificity', ylab = 'Sensitivity', type = 'l') #plot
+lines(c(0,1),c(0,1),col='red') #add random classifier line (diagonal)
+lines(c(0,0),c(0,1), col='blue')
+lines(c(1,0),c(1,1), col='blue')
+
+x_lasso <- 1-roc_lasso$specificities #extract x axis (1-specificity)
+y_lasso <- roc_lasso$sensitivities #extract y axis (sensitivity)
+plot(x_lasso, y_lasso, main = 'LASSO Model', xlab = '1 - Specificity', ylab = 'Sensitivity', type = 'l') #plot
+lines(c(0,1),c(0,1),col='red') #add random classifier line (diagonal)
+lines(c(0,0),c(0,1), col='blue')
+lines(c(1,0),c(1,1), col='blue')
+```
+
+The red diagonal represents the Random classifier which assigns each new datapoint to one of the two classes randomly.
+
+## Area Under the Curve
+
+The AUC is a measure of the discrimination ability of the model: in this setting it corresponds to the probability that a randomly extracted diabetic subject is predicted to be at higher risk of developing the disease than a non diabetic one.  
+
+To produce a more statistically meaningful measurement of the performances, each AUROC is defined as the mean of a bootstrap distribution. 
+From the same distribution the 95% Confidence Interval is also computed:
+
+```{r, echo=FALSE}
+print(paste0('Full model AUROC (95% C.I.): ', round(auroc_full_model, digits=3),
+             ' (', round(ci_full_model[1], digits=3), '-', round(ci_full_model[3], digits=3), ')'))
+
+print(paste0('Optimal Backward model AUROC (95% C.I.): ', round(auroc_backward, digits=3),
+             ' (', round(ci_backward[1], digits=3), '-', round(ci_backward[3], digits=3), ')'))
+
+print(paste0('Optimal LASSO model AUROC (95% C.I.): ', round(auroc_lasso, digits=3),
+            ' (', round(ci_lasso[1], digits=3), '-', round(ci_lasso[3], digits=3), ')'))
+```
+
+The AUROCs testify the good performance of the models, considering that the perfect classifier has a unitary AUC.
+
+
+# Conclusions
+
+In conclusion the models succeed in the classification task, given that all return an AUROC above the 0.80 value generally considered as excellent.
+In particular the LASSO model shows the most powerful capabilities, followed by the full model and the backward selection one as last.  
+
+To actually classify the subjects a threshold probability needs to be defined from the ROC curve to discriminate between the two classes based on the output predictions of the models. From the final classification then the accuracy can be computed.
+
+```{r, include=FALSE}
+lasso_final_class <- as.factor(ifelse(lasso_final_pred>0.5,1,0))
+acc_lasso_final <- max(table(lasso_final_class==test_set_imput_norm$outcome))/nrow(test_set_imput_norm)
+acc_lasso_final <- round(acc_lasso_final, digits=4)*100
+```
+
+For the sake of the example, the best model, obtained through LASSO, is tested with a threshold of 0.5 (standard value) yielding an accuracy of `r acc_lasso_final`%.
+
+An important factor we need to consider when objectively validating a classifier is the comparison to the Majority classifier (always predict more frequent class, in this case "negative" to diabetes). With the given dataset such classifier has an accuracy of `r round(sum(test_set$outcome==0)/nrow(test_set),digits=4)*100`%, which represents a naive baseline for other classifiers and, as expected, sits below the model's one computed above.
